@@ -1,26 +1,36 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+using System.Threading;
+using System.Diagnostics;
 using Discord;
 using Discord.Commands;
 using Discord.Audio;
+using NAudio;
+using NAudio.Wave;
+using NAudio.CoreAudioApi;
+using System.IO;
+using System.Text.RegularExpressions;
+using VideoLibrary;
 
 namespace UFWDiscordBot
 {
     class UFWBot
     {
-        DiscordClient _client;
+
+        static DiscordClient _client; 
         CommandService commands;
         Channel voiceChannel;
+        IAudioClient _vClient;
         bool inVoiceChannel;
+        bool player;
+
+        internal static AudioService Audio => _client.GetService<AudioService>();
 
         public UFWBot()
         {
             Initializer();
 
             commands = _client.GetService<CommandService>();
+            EventList();
             CommandsList();
 
             _client.ExecuteAndWait(async () => {
@@ -31,6 +41,7 @@ namespace UFWDiscordBot
         private void Initializer()
         {
             inVoiceChannel = false;
+            player = true;
 
             _client = new DiscordClient(x =>
             {
@@ -55,11 +66,44 @@ namespace UFWDiscordBot
             Console.WriteLine(e.Message);
         }
 
+        private void EventList()
+        {
+            userJoined();
+            userLeft();
+            userNameUpdated();
+        }
+
+        private void userJoined()
+        {
+            _client.UserJoined += async (s, e) => 
+            {
+                await e.Server.DefaultChannel.SendMessage($"{e.User.Name} joined the server.");
+            };
+        }
+
+        private void userLeft()
+        {
+            _client.UserLeft += async (s, e) =>
+            {
+                await e.Server.DefaultChannel.SendMessage($"{e.User.Name} left the server.");
+            };
+        }
+
+        private void userNameUpdated()
+        {
+            _client.UserUpdated += async (s, e) =>
+            {
+                if (e.Before.Nickname != e.After.Nickname)
+                    await e.Server.DefaultChannel.SendMessage($"{e.Before.Name} has changed to {e.After.Nickname}");
+            };
+        }
+
         private void CommandsList()
         {
             say();
             join();
             leave();
+            play();
         }
 
         private void say()
@@ -82,7 +126,7 @@ namespace UFWDiscordBot
                     if (e.User.VoiceChannel != null)
                     {
                         voiceChannel = e.User.VoiceChannel;
-                        await _client.GetService<AudioService>()
+                        _vClient = await _client.GetService<AudioService>()
                             .Join(voiceChannel);
                         inVoiceChannel = true;
                     }
@@ -97,10 +141,62 @@ namespace UFWDiscordBot
                 .Description("Leaves the voice channel")
                 .Do(async e =>
                 {
-                    await _client.GetService<AudioService>()
-                        .Leave(voiceChannel);
-                    inVoiceChannel = false;
+                    await _vClient.Disconnect();
+
                 });
+        }
+
+        private void play()
+        {
+            commands.CreateCommand("play")
+                .Description("Play")
+                .Parameter("URL", ParameterType.Required)
+                .Do(async e =>
+                {
+                    Message[] messagesToDelete;
+                    messagesToDelete = await e.Channel.DownloadMessages(1);
+                    await e.Channel.DeleteMessages(messagesToDelete);
+                    SendAudio(e.GetArg("URL"));
+                });
+        }
+
+        static WaveStream Reader(string file)
+        {
+            for (byte i = 3; i != 0; --i) try
+                {
+                    return Path.GetExtension(file) == ".ogg"
+                            ? (WaveStream)new NAudio.Vorbis.VorbisWaveReader(file)
+                            : new MediaFoundationReader(file);
+                }
+                catch { }
+            return null;
+        }
+
+        public void SendAudio(string filePath, Func<bool> cancel = null)
+        {
+            var video = YouTube.Default.GetVideo(filePath);
+            var musicReader = Reader(video.Uri);
+
+            if (musicReader == null)
+            {
+                return;
+            }
+            var channels = UFWBot.Audio.Config.Channels;
+            var outFormat = new WaveFormat(48000, 16, channels);
+            using (var resampler = new MediaFoundationResampler(musicReader, outFormat) { ResamplerQuality = 60 })
+            {
+                int blockSize = outFormat.AverageBytesPerSecond; // 1 second
+                byte[] buffer = new byte[blockSize];
+                while (cancel == null || !cancel())
+                {
+                    bool end = musicReader.Position + blockSize > musicReader.Length; // Stop at the end, work around the bug that has it Read twice.
+                    if (resampler.Read(buffer, 0, blockSize) <= 0) break; // Break on failed read.
+                    _vClient.Send(buffer, 0, blockSize);
+                    if (end) break;
+                }
+            }
+            musicReader.Dispose();
+
         }
     }
 }
