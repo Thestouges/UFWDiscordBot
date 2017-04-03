@@ -10,18 +10,22 @@ using NAudio.CoreAudioApi;
 using System.IO;
 using System.Text.RegularExpressions;
 using VideoLibrary;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 
 namespace UFWDiscordBot
 {
     class UFWBot
     {
-
-        static DiscordClient _client; 
+        static DiscordClient _client;
         CommandService commands;
         Channel voiceChannel;
-        IAudioClient _vClient;
         bool inVoiceChannel;
         bool player;
+        List<string> playlist;
+        IAudioClient _vClient;
+        string currentsong;
+        bool skipper;
 
         internal static AudioService Audio => _client.GetService<AudioService>();
 
@@ -41,7 +45,10 @@ namespace UFWDiscordBot
         private void Initializer()
         {
             inVoiceChannel = false;
-            player = true;
+            player = false;
+            playlist = new List<string>();
+            currentsong = "";
+            skipper = false;
 
             _client = new DiscordClient(x =>
             {
@@ -63,7 +70,9 @@ namespace UFWDiscordBot
 
         private void Log(object sender, LogMessageEventArgs e)
         {
-            Console.WriteLine(e.Message);
+            Console.WriteLine("1: " + e.Message +" "+ e.Source);
+            Console.WriteLine("2: " + e.Severity);
+            Console.WriteLine("3: " + e.Exception.Message);
         }
 
         private void EventList()
@@ -75,7 +84,7 @@ namespace UFWDiscordBot
 
         private void userJoined()
         {
-            _client.UserJoined += async (s, e) => 
+            _client.UserJoined += async (s, e) =>
             {
                 await e.Server.DefaultChannel.SendMessage($"{e.User.Name} joined the server.");
             };
@@ -104,6 +113,8 @@ namespace UFWDiscordBot
             join();
             leave();
             play();
+            queue();
+            skip();
         }
 
         private void say()
@@ -126,23 +137,33 @@ namespace UFWDiscordBot
                     if (e.User.VoiceChannel != null)
                     {
                         voiceChannel = e.User.VoiceChannel;
-                        _vClient = await _client.GetService<AudioService>()
-                            .Join(voiceChannel);
+                        _vClient = await JoinServer(voiceChannel);
                         inVoiceChannel = true;
+                        player = false;
                     }
                     else
                         await e.Channel.SendMessage($"You must be in a voice channel.");
                 });
         }
 
+        internal static async Task<IAudioClient> JoinServer(Channel c)
+        {
+            try { return await Audio.Join(c); }
+            catch (Exception e)
+            {
+                return null;
+            }
+        }
+
         private void leave()
         {
             commands.CreateCommand("leave")
                 .Description("Leaves the voice channel")
-                .Do(async e =>
+                .Do(async =>
                 {
-                    await _vClient.Disconnect();
-
+                    _vClient.Disconnect();
+                    playlist.Clear();
+                    inVoiceChannel = false;
                 });
         }
 
@@ -153,11 +174,75 @@ namespace UFWDiscordBot
                 .Parameter("URL", ParameterType.Required)
                 .Do(async e =>
                 {
-                    Message[] messagesToDelete;
-                    messagesToDelete = await e.Channel.DownloadMessages(1);
-                    await e.Channel.DeleteMessages(messagesToDelete);
-                    SendAudio(e.GetArg("URL"));
+                    if (inVoiceChannel == true) {
+                        Message[] messagesToDelete;
+                        messagesToDelete = await e.Channel.DownloadMessages(1);
+                        await e.Channel.DeleteMessages(messagesToDelete);
+                        playlist.Add(e.GetArg("URL"));
+                        Console.WriteLine("Playlist added: " + e.GetArg("URL"));
+                        if (!player)
+                            musicPlayer();
+                    }
                 });
+        }
+
+        private void queue()
+        {
+            commands.CreateCommand("queue")
+                .Description("Queue")
+                .Do(async e =>
+                {
+                    if (inVoiceChannel == true)
+                    {
+                        Video video = YouTube.Default.GetVideo(currentsong);
+                        await e.Channel.SendMessage("Currently Playing: " + video.Title);
+                        for (int i = 0; i < playlist.Count; i++)
+                        {
+                            video = YouTube.Default.GetVideo(playlist[i]);
+                            await e.Channel.SendMessage(i+1 + ". " + video.Title);
+                        }
+                    }
+                });
+        }
+
+        private void skip()
+        {
+            commands.CreateCommand("skip")
+                .Description("Skip")
+                .Do(async =>
+                {
+                    if (inVoiceChannel == true)
+                    {
+                        if (!skipper)
+                            skipper = true;
+                    }
+                });
+        }
+
+        private void musicPlayer() {
+            while (playlist.Count > 0)
+            {
+                if (!player)
+                {
+                    try
+                    {
+                        Video video;
+                        lock (playlist)
+                        {
+                            video = YouTube.Default.GetVideo(playlist[0]);
+                            currentsong = playlist[0];
+                            playlist.RemoveAt(0);
+                        }
+                        Console.WriteLine("Now playing: " + video.Title);
+                        SendAudio(video.Uri);
+                    }
+                    catch
+                    {
+
+                    }
+
+                }
+            }
         }
 
         static WaveStream Reader(string file)
@@ -172,17 +257,17 @@ namespace UFWDiscordBot
             return null;
         }
 
-        public void SendAudio(string filePath, Func<bool> cancel = null)
+        public void SendAudio(string uri, Func<bool> cancel = null)
         {
-            var video = YouTube.Default.GetVideo(filePath);
-            var musicReader = Reader(video.Uri);
-
+            var musicReader = Reader(uri);
             if (musicReader == null)
             {
                 return;
             }
             var channels = UFWBot.Audio.Config.Channels;
             var outFormat = new WaveFormat(48000, 16, channels);
+            player = true;
+            skipper = false;
             using (var resampler = new MediaFoundationResampler(musicReader, outFormat) { ResamplerQuality = 60 })
             {
                 int blockSize = outFormat.AverageBytesPerSecond; // 1 second
@@ -190,13 +275,24 @@ namespace UFWDiscordBot
                 while (cancel == null || !cancel())
                 {
                     bool end = musicReader.Position + blockSize > musicReader.Length; // Stop at the end, work around the bug that has it Read twice.
-                    if (resampler.Read(buffer, 0, blockSize) <= 0) break; // Break on failed read.
+                    if (resampler.Read(buffer, 0, blockSize) <= 0) {
+                        player = false;
+                        break; // Break on failed read.
+                    }
                     _vClient.Send(buffer, 0, blockSize);
-                    if (end) break;
+                    if (end)
+                    {
+                        player = false;
+                        break;
+                    }
+                    if (skipper)
+                    {
+                        player = false;
+                        break;
+                    }
                 }
             }
             musicReader.Dispose();
-
         }
     }
 }
